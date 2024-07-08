@@ -1,11 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,7 +13,7 @@ import (
 
 type Task struct {
 	Payload []byte
-	Result  chan<- string
+	Result  chan string
 }
 
 type WorkerPool struct {
@@ -21,9 +21,9 @@ type WorkerPool struct {
 	wg    sync.WaitGroup
 }
 
-func NewWorkerPool(workerCount int) *WorkerPool {
+func NewWorkerPool(workerCount int, taskQueueSize int) *WorkerPool {
 	wp := &WorkerPool{
-		tasks: make(chan Task, workerCount),
+		tasks: make(chan Task, taskQueueSize),
 	}
 
 	for i := 0; i < workerCount; i++ {
@@ -37,11 +37,14 @@ func NewWorkerPool(workerCount int) *WorkerPool {
 func (wp *WorkerPool) worker(id int) {
 	defer wp.wg.Done()
 	for task := range wp.tasks {
+		// Simulate processing time
 		time.Sleep(time.Millisecond * 10)
 
+		// Process the payload and send the response
 		response := fmt.Sprintf("Processed by worker %d", id)
 		task.Result <- response
 	}
+
 }
 
 func (wp *WorkerPool) SubmitTask(task Task) {
@@ -56,8 +59,9 @@ func (wp *WorkerPool) Shutdown() {
 var requestCount int64
 
 func main() {
-	workerCount := runtime.NumCPU() * 4
-	wp := NewWorkerPool(workerCount)
+	workerCount := 1000
+	taskQueueSize := 100000 // Size of the task queue to handle 100k requests
+	wp := NewWorkerPool(workerCount, taskQueueSize)
 	defer wp.Shutdown()
 
 	http.HandleFunc("/process", func(w http.ResponseWriter, r *http.Request) {
@@ -66,11 +70,12 @@ func main() {
 			return
 		}
 
-		payload, err := ioutil.ReadAll(r.Body)
+		payload, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "failed to load payload", http.StatusInternalServerError)
 			return
 		}
+		defer r.Body.Close() // Ensure the request body is closed
 
 		resultChan := make(chan string)
 		task := Task{
@@ -82,8 +87,14 @@ func main() {
 
 		wp.SubmitTask(task)
 
-		response := <-resultChan
-		log.Printf("processed payload: %s\n", response)
+		select {
+		case response := <-resultChan:
+			log.Printf("processed payload: %s\n", response)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"response": response})
+		case <-time.After(time.Second * 5): // Timeout for processing
+			http.Error(w, "processing timeout", http.StatusGatewayTimeout)
+		}
 	})
 
 	log.Printf("listening on port 8080\n")

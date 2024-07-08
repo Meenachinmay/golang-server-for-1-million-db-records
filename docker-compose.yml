@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  low-latency-service:
+    build: .
+    ports:
+      - "8080"
+    deploy:
+      replicas: 3
+      restart_policy:
+        condition: on-failure
+    environment:
+      - GOMAXPROCS=10
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - low-latency-service
+
+
+# hey -n 100000 -c 200 -m POST -d "test payload" http://localhost/process

@@ -10,9 +10,9 @@ import (
 )
 
 const (
-	numRequests = 10000
+	numRequests = 95000
 	concurrency = 100
-	url         = "http://localhost:8080/process"
+	url         = "http://localhost/process"
 	payload     = `{"message": "test"}`
 )
 
