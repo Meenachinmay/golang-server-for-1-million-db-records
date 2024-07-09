@@ -16,6 +16,28 @@ services:
         soft: 65536
         hard: 65536
 
+  postgres:
+    container_name: low-postgres
+    image: 'postgres:16.3-alpine'
+    ports:
+      - "5432:5432"
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: lowserver
+      PGTZ: "Asia/Tokyo"
+    volumes:
+      - ./db-data/postgres/:/var/lib/postgresql/data/
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   nginx:
     image: nginx:latest
     ports:
@@ -25,5 +47,14 @@ services:
     depends_on:
       - low-latency-service
 
-
+  rabbitmq:
+    image: 'rabbitmq:3.13-management-alpine'
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    deploy:
+      mode: replicated
+      replicas: 1
+    volumes:
+      - ./db-data/rabbitmq/:/var/lib/rabbitmq
 # hey -n 100000 -c 200 -m POST -d "test payload" http://localhost/process
