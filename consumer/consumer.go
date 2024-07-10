@@ -9,20 +9,24 @@ import (
 	"low-latency-http-server/internal/sqlc"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
 type Consumer struct {
-	conn  *amqp.Connection
-	store *sqlc.Queries
+	conn      *amqp.Connection
+	store     *sqlc.Queries
+	batchSize int
+	batch     []string
+	mu        sync.Mutex
 }
 
 type PostData struct {
 	Name string `json:"name"`
 }
 
-func NewConsumer(conn *amqp.Connection, store *sqlc.Queries) (*Consumer, error) {
-	consumer := &Consumer{conn: conn, store: store}
+func NewConsumer(conn *amqp.Connection, store *sqlc.Queries, batchSize int) (*Consumer, error) {
+	consumer := &Consumer{conn: conn, store: store, batchSize: batchSize, batch: make([]string, 0, batchSize)}
 	if err := consumer.setup(); err != nil {
 		return nil, err
 	}
@@ -85,7 +89,7 @@ func (consumer *Consumer) ConsumePostData() error {
 
 	go func() {
 		for d := range messages {
-			var payload PostData
+			var payload []string
 			if err := json.Unmarshal(d.Body, &payload); err != nil {
 				log.Printf("Failed to unmarshal message from queue: %v", err)
 				d.Nack(false, false)
@@ -94,14 +98,14 @@ func (consumer *Consumer) ConsumePostData() error {
 
 			// if everything is fine, the try to save data
 			log.Println("saving data in database...")
-			user, err := consumer.store.CreateUser(context.Background(), payload.Name)
+			_, err := consumer.store.CreateUser(context.Background(), payload)
 			if err != nil {
 				log.Printf("Failed to save data in database: %v", err)
 				d.Nack(false, true)
 				continue
 			}
 			d.Ack(false)
-			log.Println("user saved in DB", user)
+			log.Printf("successfully processed the batch of size %d\n", len(payload))
 		}
 	}()
 

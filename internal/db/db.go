@@ -1,9 +1,13 @@
 package db
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/lib/pq"
 	"log"
+	"os"
 	"time"
 )
 
@@ -23,9 +27,24 @@ func openDB() (*sql.DB, error) {
 	return db, nil
 }
 
-func ConnectToDB() *sql.DB {
+func openDBPool() (*pgxpool.Pool, error) {
+	dbpool, err := pgxpool.New(context.Background(), "postgres://postgres:password@postgres:5432/lowserver?sslmode=disable")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to create connection pool: %v\n", err)
+		return nil, err
+	}
+
+	err = dbpool.Ping(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	return dbpool, nil
+}
+
+func ConnectToDB() *pgxpool.Pool {
 	for {
-		connection, err := openDB()
+		connection, err := openDBPool()
 		if err != nil {
 			log.Println("Could not connect to database, Postgres is not ready...")
 			counts += 1

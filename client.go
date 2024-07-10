@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	users "low-latency-http-server/grpc-user"
@@ -41,9 +42,10 @@ func performRequests(client users.PostDataServiceClient, requestCount int) {
 	var wg sync.WaitGroup
 	var successCount int64
 	var failCount int64
-	var mu sync.Mutex
 	concurrency := 200 // Number of concurrent requests
 	batchSize := requestCount / concurrency
+
+	startTime := time.Now()
 
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
@@ -55,17 +57,21 @@ func performRequests(client users.PostDataServiceClient, requestCount int) {
 
 				req := &users.PostDataRequest{Name: fmt.Sprintf("Chinmay anand %d", i*batchSize+j)}
 				_, err := client.Process(ctx, req)
-				mu.Lock()
 				if err != nil {
-					failCount++
+					atomic.AddInt64(&failCount, 1)
 				} else {
-					successCount++
+					atomic.AddInt64(&successCount, 1)
 				}
-				mu.Unlock()
 			}
 		}(i)
 	}
 
 	wg.Wait()
+	totalTime := time.Since(startTime)
+	totalSeconds := totalTime.Seconds()
+	successPerSecond := float64(successCount) / totalSeconds
+
 	log.Printf("Total requests: %d, Successful: %d, Failed: %d", requestCount, successCount, failCount)
+	log.Printf("Total time taken: %.2f seconds", totalSeconds)
+	log.Printf("Successful requests per second: %.2f", successPerSecond)
 }

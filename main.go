@@ -38,15 +38,22 @@ type PostData struct {
 }
 
 type WorkerPool struct {
-	tasks   chan Task
-	wg      sync.WaitGroup
-	emitter *emitter.Emitter
+	tasks     chan Task
+	wg        sync.WaitGroup
+	emitter   *emitter.Emitter
+	batchSize int
+	dbConn    *sqlc.Queries
+	mu        sync.Mutex
+	batch     []string
 }
 
-func NewWorkerPool(workerCount int, taskQueueSize int, emitter *emitter.Emitter) *WorkerPool {
+func NewWorkerPool(workerCount int, taskQueueSize int, batchSize int, emitter *emitter.Emitter, dbConn *sqlc.Queries) *WorkerPool {
 	wp := &WorkerPool{
-		tasks:   make(chan Task, taskQueueSize),
-		emitter: emitter,
+		tasks:     make(chan Task, taskQueueSize),
+		emitter:   emitter,
+		batchSize: batchSize,
+		dbConn:    dbConn,
+		batch:     make([]string, 0, batchSize),
 	}
 
 	for i := 0; i < workerCount; i++ {
@@ -60,18 +67,54 @@ func NewWorkerPool(workerCount int, taskQueueSize int, emitter *emitter.Emitter)
 func (wp *WorkerPool) worker(id int) {
 	defer wp.wg.Done()
 	for task := range wp.tasks {
-
-		err := wp.emitter.Emit(string(task.Payload))
+		var postData PostData
+		err := json.Unmarshal(task.Payload, &postData)
 		if err != nil {
-			log.Printf("Error marshalling payload: %v", err)
-			task.Result <- "failed to process task to queue."
+			log.Printf("Error unmarshalling payload: %v", err)
+			task.Result <- "failed to unmarshal payload."
+			close(task.Result)
 			continue
+		}
+
+		wp.mu.Lock()
+		wp.batch = append(wp.batch, postData.Name)
+		if len(wp.batch) >= wp.batchSize {
+			batch := wp.batch
+			wp.batch = make([]string, 0, wp.batchSize)
+			wp.mu.Unlock()
+			wp.processBatch(batch)
+		} else {
+			wp.mu.Unlock()
 		}
 
 		response := fmt.Sprintf("Processed by worker %d, to the queue.", id)
 		task.Result <- response
+		close(task.Result)
 	}
 
+	// Process any remaining tasks in the batch
+	wp.mu.Lock()
+	if len(wp.batch) > 0 {
+		wp.processBatch(wp.batch)
+		wp.batch = nil
+	}
+	wp.mu.Unlock()
+}
+
+func (wp *WorkerPool) processBatch(batch []string) {
+	batchPayload, err := json.Marshal(batch)
+	if err != nil {
+		log.Printf("Error marshalling batch: %v", err)
+		return
+	}
+
+	err = wp.emitter.Emit(string(batchPayload))
+	if err != nil {
+		log.Printf("Error emitting batch to RabbitMQ: %v", err)
+		return
+	}
+
+	log.Printf("Successfully emitted batch of size %d", len(batch))
 }
 
 func (wp *WorkerPool) SubmitTask(task Task) {
@@ -151,9 +194,10 @@ func main() {
 	// starting consumer
 	go startConsumer(rabbitConn, sqlc.New(dbConn))
 
-	workerCount := 5000
-	taskQueueSize := 1000000 // Size of the task queue to handle 100k requests
-	wp := NewWorkerPool(workerCount, taskQueueSize, eventEmitter)
+	workerCount := runtime.NumCPU()
+	taskQueueSize := 10000 // Size of the task queue to handle 100k requests
+	batchSize := 100
+	wp := NewWorkerPool(workerCount, taskQueueSize, batchSize, eventEmitter, sqlc.New(dbConn))
 	defer wp.Shutdown()
 
 	grpcServerOptions := []grpc.ServerOption{
@@ -225,12 +269,16 @@ func connect() (*amqp.Connection, error) {
 }
 
 func startConsumer(conn *amqp.Connection, store *sqlc.Queries) {
-	consumer, err := consumer.NewConsumer(conn, store)
+	cc, err := consumer.NewConsumer(conn, store)
 	if err != nil {
 		log.Fatalf("Failed to create post data consumer:[startConsumer] %v", err)
+	} else {
+		log.Println("Consumer created...")
 	}
-	err = consumer.ConsumePostData()
+	err = cc.ConsumePostData()
 	if err != nil {
 		log.Fatalf("Failed to post data:[startConsumer] %v", err)
+	} else {
+		log.Println("Post data consumed...")
 	}
 }

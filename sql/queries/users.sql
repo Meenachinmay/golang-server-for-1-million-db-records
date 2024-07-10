@@ -1,4 +1,3 @@
--- name: CreateUser :one
+-- name: CreateUser :copyfrom
 INSERT INTO users (name)
-VALUES ($1)
-RETURNING *;
+VALUES ($1);
