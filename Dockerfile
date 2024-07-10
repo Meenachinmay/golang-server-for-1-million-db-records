@@ -15,6 +15,6 @@ COPY --from=builder /app/main .
 
 RUN chmod +x /app/main
 
-EXPOSE 8080
+EXPOSE 50051
 
 CMD ["sh", "-c","/app/main"]

@@ -1,21 +1,30 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	_ "github.com/lib/pq"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/sony/gobreaker"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/reflection"
 	"log"
 	"low-latency-http-server/consumer"
 	emitter "low-latency-http-server/emitter"
+	users "low-latency-http-server/grpc-user"
 	"low-latency-http-server/internal/db"
 	"low-latency-http-server/internal/sqlc"
 	"math"
-	"net/http"
+	"net"
 	"os"
+	"os/signal"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -59,9 +68,6 @@ func (wp *WorkerPool) worker(id int) {
 			continue
 		}
 
-		// Simulate processing time
-		time.Sleep(time.Millisecond * 10)
-
 		response := fmt.Sprintf("Processed by worker %d, to the queue.", id)
 		task.Result <- response
 	}
@@ -77,9 +83,52 @@ func (wp *WorkerPool) Shutdown() {
 	wp.wg.Wait()
 }
 
+type server struct {
+	users.UnimplementedPostDataServiceServer
+	workerPool     *WorkerPool
+	circuitBreaker *gobreaker.CircuitBreaker
+}
+
+func (s *server) Process(ctx context.Context, req *users.PostDataRequest) (*users.PostDataResponse, error) {
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	resultChan := make(chan string)
+	task := Task{
+		Payload: payload,
+		Result:  resultChan,
+	}
+
+	atomic.AddInt64(&requestCount, 1)
+
+	s.workerPool.SubmitTask(task)
+
+	select {
+	case response := <-resultChan:
+		log.Printf("processed payload: %s\n", response)
+		return &users.PostDataResponse{Response: response}, nil
+	case <-time.After(time.Second * 5): // Timeout for processing
+		return nil, fmt.Errorf("processing timeout")
+	}
+
+}
+
 var requestCount int64
 
 func main() {
+	// Set GOMAXPROCS to the number of available CPUs
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// Create a circuit breaker
+	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "gRPC Circuit Breaker",
+		MaxRequests: 1000,             // Allow 1000 requests during the half-open state
+		Interval:    30 * time.Second, // Reset the failure count after this interval
+		Timeout:     10 * time.Second, // Timeout duration for the open state
+	})
 
 	// connect to database
 	dbConn := db.ConnectToDB()
@@ -93,7 +142,7 @@ func main() {
 
 	defer rabbitConn.Close()
 
-	emitter, err := emitter.NewEmitter(rabbitConn, "data_exchange", "post_data")
+	eventEmitter, err := emitter.NewEmitter(rabbitConn, "data_exchange", "post_data")
 	if err != nil {
 		log.Println(errors.New("failed to create emitter: " + err.Error()))
 		return
@@ -102,52 +151,45 @@ func main() {
 	// starting consumer
 	go startConsumer(rabbitConn, sqlc.New(dbConn))
 
-	workerCount := 1000
-	taskQueueSize := 100000 // Size of the task queue to handle 100k requests
-	wp := NewWorkerPool(workerCount, taskQueueSize, emitter)
+	workerCount := 5000
+	taskQueueSize := 1000000 // Size of the task queue to handle 100k requests
+	wp := NewWorkerPool(workerCount, taskQueueSize, eventEmitter)
 	defer wp.Shutdown()
 
-	http.HandleFunc("/process", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "not a post method", http.StatusMethodNotAllowed)
-			return
+	grpcServerOptions := []grpc.ServerOption{
+		grpc.MaxConcurrentStreams(1000),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 5 * time.Minute,
+			Time:              2 * time.Hour,
+			Timeout:           20 * time.Second,
+		}),
+	}
+
+	listener, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatalf("Failed to listen on port 50051: %v", err)
+	}
+
+	grpcServer := grpc.NewServer(grpcServerOptions...)
+	users.RegisterPostDataServiceServer(grpcServer, &server{workerPool: wp, circuitBreaker: cb})
+	reflection.Register(grpcServer)
+
+	log.Println("gRPC server listening on port 50051")
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil {
+			log.Fatalf("failed to serve: %v", err)
 		}
+	}()
 
-		var postData PostData
-		err := json.NewDecoder(r.Body).Decode(&postData)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+	// Handle graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
 
-		payload, err := json.Marshal(postData)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+	log.Println("Shutting down server...")
 
-		resultChan := make(chan string)
-		task := Task{
-			Payload: payload,
-			Result:  resultChan,
-		}
-
-		atomic.AddInt64(&requestCount, 1)
-
-		wp.SubmitTask(task)
-
-		select {
-		case response := <-resultChan:
-			log.Printf("processed payload: %s\n", response)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"response": response})
-		case <-time.After(time.Second * 5): // Timeout for processing
-			http.Error(w, "processing timeout", http.StatusGatewayTimeout)
-		}
-	})
-
-	log.Printf("listening on port 8080\n")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	grpcServer.GracefulStop()
+	log.Println("Server gracefully stopped")
 }
 
 // connect to rabbitmq api-gateway
@@ -191,31 +233,4 @@ func startConsumer(conn *amqp.Connection, store *sqlc.Queries) {
 	if err != nil {
 		log.Fatalf("Failed to post data:[startConsumer] %v", err)
 	}
-}
-
-// PurgeQueue removes all messages from the specified queue
-func PurgeQueue(conn *amqp.Connection, queueName string) error {
-	channel, err := conn.Channel()
-	if err != nil {
-		return err
-	}
-	defer channel.Close()
-
-	// Check the queue to see if there are messages to purge
-	queue, err := channel.QueueInspect(queueName)
-	if err != nil {
-		return err
-	}
-
-	if queue.Messages > 0 {
-		_, err = channel.QueuePurge(queueName, false)
-		if err != nil {
-			return err
-		}
-		log.Printf("Queue %s purged", queueName)
-	} else {
-		log.Printf("Queue %s is already empty", queueName)
-	}
-
-	return nil
 }

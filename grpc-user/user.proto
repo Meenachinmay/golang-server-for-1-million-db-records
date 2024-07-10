@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package users;
+
+option go_package = "/users";
+
+message PostDataRequest {
+  string name = 1;
+}
+
+message PostDataResponse {
+  string response = 1;
+}
+
+service PostDataService {
+  rpc Process (PostDataRequest) returns (PostDataResponse);
+}

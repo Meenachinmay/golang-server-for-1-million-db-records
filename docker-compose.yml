@@ -4,13 +4,17 @@ services:
   low-latency-service:
     build: .
     ports:
-      - "8080"
+      - "50051"
     deploy:
       replicas: 3
       restart_policy:
         condition: on-failure
+#      resources:
+#        limits:
+#          cpus: '2'      # Limit to 2 CPU cores
+#          memory: '4g'   # Limit to 4GB of memory
     environment:
-      - GOMAXPROCS=10
+      - GOMAXPROCS=14
     ulimits:
       nofile:
         soft: 65536
@@ -58,3 +62,11 @@ services:
     volumes:
       - ./db-data/rabbitmq/:/var/lib/rabbitmq
 # hey -n 100000 -c 200 -m POST -d "test payload" http://localhost/process
+
+#  ghz --insecure \
+#  --proto ./grpc-user/user.proto \
+#  --call users.PostDataService.Process \
+#-d '{"name": "Chinmay anand"}' \
+#  -c 300 \
+#  -n 1000000 \
+#  localhost:80

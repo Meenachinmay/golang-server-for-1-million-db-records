@@ -1,51 +1,71 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"io/ioutil"
-	"net/http"
+	"log"
 	"sync"
 	"time"
-)
 
-const (
-	numRequests = 95000
-	concurrency = 100
-	url         = "http://localhost/process"
-	payload     = `{"message": "test"}`
+	users "low-latency-http-server/grpc-user"
 )
 
 func main() {
-	start := time.Now()
+	// Load gRPC configuration
+	configData, err := ioutil.ReadFile("grpc_config.json")
+	if err != nil {
+		log.Fatalf("Failed to read gRPC config file: %v", err)
+	}
 
+	// Dial the gRPC server with the service config
+	conn, err := grpc.Dial(
+		"localhost:80",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultServiceConfig(string(configData)),
+	)
+	if err != nil {
+		log.Fatalf("Did not connect: %v", err)
+	}
+	defer conn.Close()
+
+	client := users.NewPostDataServiceClient(conn)
+
+	// Perform gRPC requests
+	performRequests(client, 1000000)
+}
+
+func performRequests(client users.PostDataServiceClient, requestCount int) {
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, concurrency) // Limit the number of concurrent goroutines
+	var successCount int64
+	var failCount int64
+	var mu sync.Mutex
+	concurrency := 200 // Number of concurrent requests
+	batchSize := requestCount / concurrency
 
-	for i := 0; i < numRequests; i++ {
+	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
-		semaphore <- struct{}{}
 		go func(i int) {
 			defer wg.Done()
-			defer func() { <-semaphore }() // Release the semaphore slot
+			for j := 0; j < batchSize; j++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
 
-			resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(payload)))
-			if err != nil {
-				fmt.Printf("Request %d failed: %v\n", i, err)
-				return
+				req := &users.PostDataRequest{Name: fmt.Sprintf("Chinmay anand %d", i*batchSize+j)}
+				_, err := client.Process(ctx, req)
+				mu.Lock()
+				if err != nil {
+					failCount++
+				} else {
+					successCount++
+				}
+				mu.Unlock()
 			}
-			defer resp.Body.Close()
-
-			body, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				fmt.Printf("Request %d failed to read response: %v\n", i, err)
-				return
-			}
-			fmt.Printf("Request %d: %s\n", i, body)
 		}(i)
 	}
 
 	wg.Wait()
-	duration := time.Since(start)
-	fmt.Printf("Completed %d requests in %v\n", numRequests, duration)
+	log.Printf("Total requests: %d, Successful: %d, Failed: %d", requestCount, successCount, failCount)
 }
